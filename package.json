@@ -1,7 +1,7 @@
 {
   "name": "pc-sharer",
   "private": true,
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "LAN file sharing desktop app",
   "type": "module",
   "scripts": {

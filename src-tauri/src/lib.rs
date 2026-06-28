@@ -9,6 +9,7 @@ use std::{
     io::{Cursor, SeekFrom},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Component, Path, PathBuf},
+    process::Command,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -238,7 +239,7 @@ impl RuntimeState {
             .parent()
             .ok_or_else(|| "配置路径异常".to_string())?
             .join("history.json");
-        let config = if config_path.exists() {
+        let mut config = if config_path.exists() {
             let raw = fs::read_to_string(&config_path)
                 .map_err(|error| format!("读取配置失败: {error}"))?;
             serde_json::from_str(&raw).map_err(|error| format!("解析配置失败: {error}"))?
@@ -255,6 +256,10 @@ impl RuntimeState {
             save_config_file(&config_path, &config)?;
             config
         };
+
+        if refresh_default_device_name(&mut config) {
+            save_config_file(&config_path, &config)?;
+        }
 
         fs::create_dir_all(&config.inbox_dir)
             .map_err(|error| format!("创建收件箱失败: {error}"))?;
@@ -2147,11 +2152,103 @@ fn load_history_file(path: &Path) -> HashMap<String, TransferSnapshot> {
         .collect()
 }
 
+fn refresh_default_device_name(config: &mut Config) -> bool {
+    let preferred_name = default_device_name();
+    if should_replace_device_name(&config.device_name, &preferred_name) {
+        config.device_name = preferred_name;
+        return true;
+    }
+
+    false
+}
+
+fn should_replace_device_name(current: &str, preferred: &str) -> bool {
+    let current = current.trim();
+    let preferred = preferred.trim();
+    if preferred.is_empty() || current == preferred {
+        return false;
+    }
+
+    current.is_empty()
+        || current == "PC Sharer"
+        || legacy_device_name_candidates()
+            .iter()
+            .any(|candidate| candidate == current)
+}
+
 fn default_device_name() -> String {
-    env::var("COMPUTERNAME")
-        .or_else(|_| env::var("HOSTNAME"))
-        .map(|name| format!("{name}"))
-        .unwrap_or_else(|_| "PC Sharer".to_string())
+    device_name_candidates()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "PC Sharer".to_string())
+}
+
+fn device_name_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if cfg!(target_os = "macos") {
+        for key in ["ComputerName", "LocalHostName", "HostName"] {
+            if let Some(name) = command_output("/usr/sbin/scutil", &["--get", key]) {
+                candidates.push(name);
+            }
+        }
+    }
+
+    if let Ok(name) = env::var("COMPUTERNAME") {
+        candidates.push(name);
+    }
+    if let Ok(name) = env::var("HOSTNAME") {
+        candidates.push(name);
+    }
+    if let Some(name) = command_output("/bin/hostname", &[]) {
+        candidates.push(name);
+    }
+
+    unique_device_names(candidates)
+}
+
+fn legacy_device_name_candidates() -> Vec<String> {
+    let mut candidates = vec!["PC Sharer".to_string()];
+
+    if let Ok(name) = env::var("COMPUTERNAME") {
+        candidates.push(name);
+    }
+    if let Ok(name) = env::var("HOSTNAME") {
+        candidates.push(name);
+    }
+    if let Some(name) = command_output("/bin/hostname", &[]) {
+        candidates.push(name);
+    }
+
+    unique_device_names(candidates)
+}
+
+fn command_output(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8(output.stdout).ok()?;
+    sanitize_device_name(&raw)
+}
+
+fn sanitize_device_name(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_end_matches('.').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn unique_device_names(candidates: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|name| sanitize_device_name(&name))
+        .filter(|name| seen.insert(name.to_lowercase()))
+        .collect()
 }
 
 fn default_inbox_dir() -> PathBuf {

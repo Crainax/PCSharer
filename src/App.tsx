@@ -60,7 +60,7 @@ type ToastItem = {
   tone: ToastTone;
 };
 
-const fallbackVersion = "0.2.4";
+const fallbackVersion = "0.2.5";
 const imageExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
 
 function getSystemTheme(): ThemeName {

@@ -5,8 +5,10 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  Check,
   CheckCircle2,
   CircleAlert,
+  Clipboard,
   Clock3,
   FolderOpen,
   HardDriveDownload,
@@ -14,8 +16,12 @@ import {
   Network,
   Plus,
   RefreshCw,
+  RotateCcw,
+  Search,
   Send,
   Settings,
+  ShieldCheck,
+  ShieldOff,
   UploadCloud,
   Wifi,
   X,
@@ -26,6 +32,7 @@ import { formatBytes, formatRelativeTime, transferProgress } from "./format";
 const statusLabel: Record<TransferSnapshot["status"], string> = {
   queued: "排队中",
   connecting: "连接中",
+  pending: "待确认",
   sending: "发送中",
   receiving: "接收中",
   completed: "已完成",
@@ -63,6 +70,7 @@ export default function App() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>("");
   const [manualHost, setManualHost] = useState("");
+  const [historyQuery, setHistoryQuery] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -197,6 +205,74 @@ export default function App() {
     }
   }, [selectedDevice, selectedPaths]);
 
+  const sendClipboardImage = useCallback(async () => {
+    if (!selectedDevice) {
+      return;
+    }
+
+    setIsSending(true);
+    setNotice(null);
+
+    try {
+      await invoke<string>("send_clipboard_image", {
+        targetDeviceId: selectedDevice.id,
+      });
+    } catch (error) {
+      setNotice(String(error));
+    } finally {
+      setIsSending(false);
+    }
+  }, [selectedDevice]);
+
+  const toggleTrusted = useCallback(
+    async (device: DeviceSnapshot) => {
+      try {
+        const next = await invoke<DeviceSnapshot[]>("set_device_trusted", {
+          deviceId: device.id,
+          trusted: !device.isTrusted,
+        });
+        setDevices(next);
+        const info = await invoke<AppInfo>("get_app_info");
+        setAppInfo(info);
+      } catch (error) {
+        setNotice(String(error));
+      }
+    },
+    [],
+  );
+
+  const acceptTransfer = useCallback(
+    async (transfer: TransferSnapshot, trustSender: boolean) => {
+      try {
+        await invoke<void>("accept_incoming_transfer", {
+          transferId: transfer.id,
+          trustSender,
+        });
+      } catch (error) {
+        setNotice(String(error));
+      }
+    },
+    [],
+  );
+
+  const declineTransfer = useCallback(async (transfer: TransferSnapshot) => {
+    try {
+      await invoke<void>("decline_incoming_transfer", {
+        transferId: transfer.id,
+      });
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, []);
+
+  const retryTransfer = useCallback(async (transfer: TransferSnapshot) => {
+    try {
+      await invoke<string>("retry_transfer", { transferId: transfer.id });
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, []);
+
   const removeSelectedPath = useCallback((path: string) => {
     setSelectedPaths((current) => current.filter((item) => item !== path));
   }, []);
@@ -207,7 +283,26 @@ export default function App() {
     }
   }, [appInfo]);
 
-  const latestTransfers = transfers.slice(0, 12);
+  const normalizedHistoryQuery = historyQuery.trim().toLowerCase();
+  const latestTransfers = transfers
+    .filter((transfer) => {
+      if (!normalizedHistoryQuery) {
+        return true;
+      }
+
+      return [
+        transfer.title,
+        transfer.peerName,
+        transfer.peerIp ?? "",
+        transfer.currentFile ?? "",
+        transfer.message ?? "",
+        ...transfer.sourcePaths,
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(normalizedHistoryQuery);
+    })
+    .slice(0, 30);
 
   return (
     <main className="app">
@@ -274,6 +369,15 @@ export default function App() {
               <FolderOpen size={16} />
               选择文件夹
             </button>
+            <button
+              className="button secondary"
+              disabled={!selectedDevice || isSending}
+              onClick={sendClipboardImage}
+              type="button"
+            >
+              <Clipboard size={16} />
+              发送剪贴板图片
+            </button>
           </div>
 
           <div className="selection-list">
@@ -335,25 +439,42 @@ export default function App() {
               <div className="empty-state">暂未发现其他电脑</div>
             ) : (
               devices.map((device) => (
-                <button
+                <div
                   className={`device-row ${
                     selectedDeviceId === device.id ? "is-selected" : ""
                   }`}
                   key={device.id}
-                  onClick={() => setSelectedDeviceId(device.id)}
-                  type="button"
                 >
-                  <MonitorUp size={21} />
-                  <div>
-                    <strong>{device.name}</strong>
-                    <span>
-                      {device.ip}:{device.tcpPort} · {device.platform}
-                      {device.isManual
-                        ? " · 手动"
-                        : ` · ${formatRelativeTime(device.lastSeenMs)}`}
-                    </span>
-                  </div>
-                </button>
+                  <button
+                    className="device-select"
+                    onClick={() => setSelectedDeviceId(device.id)}
+                    type="button"
+                  >
+                    <MonitorUp size={21} />
+                    <div>
+                      <strong>{device.name}</strong>
+                      <span>
+                        {device.ip}:{device.tcpPort} · {device.platform}
+                        {device.isManual
+                          ? " · 手动"
+                          : ` · ${formatRelativeTime(device.lastSeenMs)}`}
+                        {device.isTrusted ? " · 白名单" : ""}
+                      </span>
+                    </div>
+                  </button>
+                  <button
+                    className="icon-button trust-button"
+                    onClick={() => toggleTrusted(device)}
+                    title={device.isTrusted ? "取消自动接收" : "加入自动接收白名单"}
+                    type="button"
+                  >
+                    {device.isTrusted ? (
+                      <ShieldCheck size={17} />
+                    ) : (
+                      <ShieldOff size={17} />
+                    )}
+                  </button>
+                </div>
               ))
             )}
           </div>
@@ -384,6 +505,15 @@ export default function App() {
             <Clock3 size={22} />
           </div>
 
+          <div className="search-row">
+            <Search size={16} />
+            <input
+              onChange={(event) => setHistoryQuery(event.target.value)}
+              placeholder="搜索文件、电脑或 IP"
+              value={historyQuery}
+            />
+          </div>
+
           <div className="transfer-list">
             {latestTransfers.length === 0 ? (
               <div className="empty-state">暂无传输</div>
@@ -400,6 +530,8 @@ export default function App() {
                       <div className="transfer-title">
                         {transfer.status === "completed" ? (
                           <CheckCircle2 size={18} />
+                        ) : transfer.status === "pending" ? (
+                          <CircleAlert size={18} />
                         ) : transfer.status === "failed" ? (
                           <CircleAlert size={18} />
                         ) : (
@@ -423,7 +555,49 @@ export default function App() {
                       <div className="progress-track">
                         <div style={{ width: `${progress}%` }} />
                       </div>
+                      {transfer.canAccept ? (
+                        <div className="transfer-actions">
+                          <button
+                            className="button secondary"
+                            onClick={() => acceptTransfer(transfer, false)}
+                            type="button"
+                          >
+                            <Check size={16} />
+                            接收
+                          </button>
+                          <button
+                            className="button secondary"
+                            onClick={() => acceptTransfer(transfer, true)}
+                            type="button"
+                          >
+                            <ShieldCheck size={16} />
+                            接收并信任
+                          </button>
+                          <button
+                            className="button secondary"
+                            onClick={() => declineTransfer(transfer)}
+                            type="button"
+                          >
+                            <X size={16} />
+                            拒绝
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
+                    {transfer.canRetry ? (
+                      <button
+                        className="icon-button"
+                        onClick={() => retryTransfer(transfer)}
+                        title={
+                          transfer.status === "failed"
+                            ? "重试并断点续传"
+                            : "重新发送"
+                        }
+                        type="button"
+                      >
+                        <RotateCcw size={17} />
+                      </button>
+                    ) : null}
                     {transfer.savedPath ? (
                       <button
                         className="icon-button"

@@ -5,6 +5,7 @@ export type AppInfo = {
   localIp: string | null;
   tcpPort: number;
   udpPort: number;
+  trustedDeviceIds: string[];
 };
 
 export type DeviceSnapshot = {
@@ -15,12 +16,14 @@ export type DeviceSnapshot = {
   platform: string;
   lastSeenMs: number;
   isManual: boolean;
+  isTrusted: boolean;
 };
 
 export type TransferDirection = "send" | "receive";
 export type TransferStatus =
   | "queued"
   | "connecting"
+  | "pending"
   | "sending"
   | "receiving"
   | "completed"
@@ -31,6 +34,8 @@ export type TransferSnapshot = {
   direction: TransferDirection;
   peerId: string;
   peerName: string;
+  peerIp: string | null;
+  peerTcpPort: number | null;
   title: string;
   status: TransferStatus;
   bytesDone: number;
@@ -39,6 +44,9 @@ export type TransferSnapshot = {
   currentFile: string | null;
   savedPath: string | null;
   message: string | null;
+  sourcePaths: string[];
+  canRetry: boolean;
+  canAccept: boolean;
   startedAtMs: number;
   updatedAtMs: number;
 };

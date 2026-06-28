@@ -114,7 +114,7 @@ button {
 
 .button:not(:disabled):active,
 .icon-button:not(:disabled):active,
-.device-row:active,
+.device-select:active,
 .drop-zone:active {
   transform: translateY(1px);
 }
@@ -330,12 +330,30 @@ button {
 
 .device-row {
   width: 100%;
+  padding: 0;
   text-align: left;
 }
 
 .device-row.is-selected {
   border-color: #16856d;
   background: #ecf7f3;
+}
+
+.device-select {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+  border: 0;
+  background: transparent;
+  padding: 10px;
+  color: inherit;
+  text-align: left;
+}
+
+.trust-button {
+  margin-right: 8px;
 }
 
 .send-button {
@@ -364,6 +382,32 @@ button {
 
 .transfer-message {
   color: #9b3d27;
+}
+
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #cfdde2;
+  border-radius: 7px;
+  background: #ffffff;
+  padding: 0 10px;
+}
+
+.search-row input {
+  min-width: 0;
+  flex: 1;
+  height: 36px;
+  border: 0;
+  outline: 0;
+  color: #1d292e;
+}
+
+.transfer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
 
 .progress-track {

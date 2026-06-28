@@ -11,6 +11,15 @@ LAN file sharing desktop app for Windows/macOS, built with Tauri 2, React, and R
 - Receive automatically into `Downloads/PCSharer` unless changed in the app.
 - Show transfer progress and recent transfer records.
 
+## Version 2 scope
+
+- Resume interrupted sends from receiver-side `.part` files when retrying failed transfers.
+- Preserve folder structure for batch folder sends.
+- Send the current clipboard image as a PNG.
+- Keep the app running in the system tray when the window is closed.
+- Trust devices for automatic receiving, while unknown senders require manual accept/decline.
+- Search transfer history and resend previous send records.
+
 ## Development
 
 ```powershell

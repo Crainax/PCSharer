@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -12,6 +13,7 @@ import {
   Clock3,
   FolderOpen,
   HardDriveDownload,
+  Moon,
   MonitorUp,
   Network,
   Plus,
@@ -22,6 +24,7 @@ import {
   Settings,
   ShieldCheck,
   ShieldOff,
+  Sun,
   UploadCloud,
   Wifi,
   X,
@@ -38,6 +41,16 @@ const statusLabel: Record<TransferSnapshot["status"], string> = {
   completed: "已完成",
   failed: "失败",
 };
+
+type ThemeName = "light" | "dark";
+
+const fallbackVersion = "0.2.1";
+
+function getSystemTheme(): ThemeName {
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
+}
 
 function uniquePaths(paths: string[]): string[] {
   return Array.from(new Set(paths.filter(Boolean)));
@@ -65,6 +78,8 @@ function upsertTransfer(
 
 export default function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const [appVersion, setAppVersion] = useState(fallbackVersion);
+  const [theme, setTheme] = useState<ThemeName>(() => getSystemTheme());
   const [devices, setDevices] = useState<DeviceSnapshot[]>([]);
   const [transfers, setTransfers] = useState<TransferSnapshot[]>([]);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
@@ -79,6 +94,22 @@ export default function App() {
     () => devices.find((device) => device.id === selectedDeviceId) ?? null,
     [devices, selectedDeviceId],
   );
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
+
+  useEffect(() => {
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleSystemThemeChange = () => setTheme(getSystemTheme());
+    query.addEventListener("change", handleSystemThemeChange);
+
+    getVersion()
+      .then(setAppVersion)
+      .catch(() => setAppVersion(fallbackVersion));
+
+    return () => query.removeEventListener("change", handleSystemThemeChange);
+  }, []);
 
   const refresh = useCallback(async () => {
     const [info, nextDevices, nextTransfers] = await Promise.all([
@@ -283,6 +314,10 @@ export default function App() {
     }
   }, [appInfo]);
 
+  const toggleTheme = useCallback(() => {
+    setTheme((current) => (current === "dark" ? "light" : "dark"));
+  }, []);
+
   const normalizedHistoryQuery = historyQuery.trim().toLowerCase();
   const latestTransfers = transfers
     .filter((transfer) => {
@@ -311,6 +346,7 @@ export default function App() {
           <div className="brand">
             <Network size={22} />
             <h1>PC Sharer</h1>
+            <span className="version-label">v{appVersion}</span>
           </div>
           <p className="muted">
             {appInfo
@@ -319,6 +355,10 @@ export default function App() {
           </p>
         </div>
         <div className="top-actions">
+          <button className="button secondary" onClick={toggleTheme} type="button">
+            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+            {theme === "dark" ? "浅色" : "深色"}
+          </button>
           <button className="button secondary" onClick={refresh} type="button">
             <RefreshCw size={16} />
             刷新

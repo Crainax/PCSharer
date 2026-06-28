@@ -8,6 +8,8 @@ export type AppInfo = {
   udpPort: number;
   trustedDeviceIds: string[];
   autoAcceptIncoming: boolean;
+  textDraft: string;
+  offlinePaths: string[];
 };
 
 export type DeviceSnapshot = {
@@ -22,6 +24,7 @@ export type DeviceSnapshot = {
 };
 
 export type TransferDirection = "send" | "receive";
+export type TransferKind = "file" | "text";
 export type TransferStatus =
   | "queued"
   | "connecting"
@@ -33,6 +36,7 @@ export type TransferStatus =
 
 export type TransferSnapshot = {
   id: string;
+  kind: TransferKind;
   direction: TransferDirection;
   peerId: string;
   peerName: string;
@@ -46,9 +50,21 @@ export type TransferSnapshot = {
   currentFile: string | null;
   savedPath: string | null;
   message: string | null;
+  text: string | null;
   sourcePaths: string[];
   canRetry: boolean;
   canAccept: boolean;
   startedAtMs: number;
   updatedAtMs: number;
+};
+
+export type BatchSendResult = {
+  transferIds: string[];
+  queued: boolean;
+  targetCount: number;
+};
+
+export type OfflineQueueStarted = {
+  targetName: string;
+  paths: string[];
 };

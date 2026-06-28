@@ -2609,7 +2609,7 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pc-sharer"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -2625,6 +2625,7 @@ dependencies = [
  "tokio",
  "uuid",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

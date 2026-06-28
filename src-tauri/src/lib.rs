@@ -32,12 +32,13 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UDP_PORT: u16 = 53342;
 const TCP_PORT: u16 = 53343;
 const DISCOVERY_INTERVAL_MS: u64 = 1000;
-const DEVICE_STALE_MS: u128 = 6_000;
+const DEVICE_STALE_MS: u128 = 5_000;
 const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const INCOMING_DECISION_TIMEOUT_SECONDS: u64 = 300;
 const MAX_HISTORY_ITEMS: usize = 300;
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +50,10 @@ struct Config {
     trusted_device_ids: Vec<String>,
     #[serde(default)]
     auto_accept_incoming: bool,
+    #[serde(default)]
+    text_draft: String,
+    #[serde(default)]
+    offline_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +68,8 @@ pub struct AppInfo {
     udp_port: u16,
     trusted_device_ids: Vec<String>,
     auto_accept_incoming: bool,
+    text_draft: String,
+    offline_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,10 +104,23 @@ pub enum TransferStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferKind {
+    File,
+    Text,
+}
+
+fn default_transfer_kind() -> TransferKind {
+    TransferKind::File
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferSnapshot {
     id: String,
+    #[serde(default = "default_transfer_kind")]
+    kind: TransferKind,
     direction: TransferDirection,
     peer_id: String,
     peer_name: String,
@@ -116,6 +136,8 @@ pub struct TransferSnapshot {
     current_file: Option<String>,
     saved_path: Option<String>,
     message: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
     #[serde(default)]
     source_paths: Vec<String>,
     #[serde(default)]
@@ -150,11 +172,15 @@ struct TransferRequest {
     protocol: String,
     version: String,
     transfer_id: String,
+    #[serde(default = "default_transfer_kind")]
+    kind: TransferKind,
     sender_id: String,
     sender_name: String,
     file_count: usize,
     total_bytes: u64,
     files: Vec<FileManifest>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +189,21 @@ struct TransferResponse {
     accepted: bool,
     message: Option<String>,
     offsets: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchSendResult {
+    transfer_ids: Vec<String>,
+    queued: bool,
+    target_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineQueueStarted {
+    target_name: String,
+    paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +249,8 @@ impl RuntimeState {
                 inbox_dir: default_inbox_dir().to_string_lossy().to_string(),
                 trusted_device_ids: Vec::new(),
                 auto_accept_incoming: false,
+                text_draft: String::new(),
+                offline_paths: Vec::new(),
             };
             save_config_file(&config_path, &config)?;
             config
@@ -231,7 +274,11 @@ impl RuntimeState {
 
 #[tauri::command]
 async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String> {
-    let config = state.inner.config.read().await.clone();
+    build_app_info(&state.inner).await
+}
+
+async fn build_app_info(state: &Arc<RuntimeState>) -> Result<AppInfo, String> {
+    let config = state.config.read().await.clone();
     let local_ips = local_ips();
     Ok(AppInfo {
         device_id: config.device_id,
@@ -243,7 +290,15 @@ async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String> {
         udp_port: UDP_PORT,
         trusted_device_ids: config.trusted_device_ids,
         auto_accept_incoming: config.auto_accept_incoming,
+        text_draft: config.text_draft,
+        offline_paths: config.offline_paths,
     })
+}
+
+async fn emit_app_info_updated(state: &Arc<RuntimeState>, app: &AppHandle) {
+    if let Ok(info) = build_app_info(state).await {
+        let _ = app.emit("app-info-updated", info);
+    }
 }
 
 #[tauri::command]
@@ -285,6 +340,41 @@ async fn set_auto_accept_incoming(
     }
 
     get_app_info(state).await
+}
+
+#[tauri::command]
+async fn set_text_draft(text: String, state: State<'_, AppState>) -> Result<AppInfo, String> {
+    validate_text_size(&text)?;
+
+    {
+        let mut config = state.inner.config.write().await;
+        config.text_draft = text;
+        save_config_file(&state.inner.config_path, &config)?;
+    }
+
+    build_app_info(&state.inner).await
+}
+
+#[tauri::command]
+async fn queue_offline_paths(
+    paths: Vec<String>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<AppInfo, String> {
+    let paths = unique_nonempty_paths(paths);
+    let files = collect_files(&paths)?;
+    if files.is_empty() {
+        return Err("没有可发送的文件".to_string());
+    }
+
+    {
+        let mut config = state.inner.config.write().await;
+        config.offline_paths = paths;
+        save_config_file(&state.inner.config_path, &config)?;
+    }
+
+    emit_app_info_updated(&state.inner, &app).await;
+    build_app_info(&state.inner).await
 }
 
 #[tauri::command]
@@ -379,6 +469,115 @@ async fn send_clipboard_image(
         false,
     )
     .await
+}
+
+#[tauri::command]
+async fn cache_clipboard_image(state: State<'_, AppState>) -> Result<String, String> {
+    let image_path = read_clipboard_image_to_file(&state.inner).await?;
+    Ok(image_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn read_clipboard_file_paths() -> Result<Vec<String>, String> {
+    read_clipboard_file_paths_impl().await
+}
+
+#[tauri::command]
+async fn send_text(
+    text: String,
+    target_device_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    start_send_text(state.inner.clone(), app, text, target_device_id).await
+}
+
+#[tauri::command]
+async fn broadcast_text(
+    text: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<BatchSendResult, String> {
+    validate_text_size(&text)?;
+    if text.trim().is_empty() {
+        return Err("请输入要发送的文字".to_string());
+    }
+
+    let targets: Vec<_> = snapshot_devices(&state.inner)
+        .await
+        .into_iter()
+        .filter(|device| !device.is_manual)
+        .collect();
+
+    if targets.is_empty() {
+        return Err("暂无自动发现电脑，无法广播文字".to_string());
+    }
+
+    let mut transfer_ids = Vec::with_capacity(targets.len());
+    for target in targets {
+        let transfer_id =
+            start_send_text(state.inner.clone(), app.clone(), text.clone(), target.id).await?;
+        transfer_ids.push(transfer_id);
+    }
+
+    Ok(BatchSendResult {
+        target_count: transfer_ids.len(),
+        transfer_ids,
+        queued: false,
+    })
+}
+
+#[tauri::command]
+async fn broadcast_paths(
+    paths: Vec<String>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<BatchSendResult, String> {
+    let paths = unique_nonempty_paths(paths);
+    let files = collect_files(&paths)?;
+    if files.is_empty() {
+        return Err("没有可发送的文件".to_string());
+    }
+
+    let targets: Vec<_> = snapshot_devices(&state.inner)
+        .await
+        .into_iter()
+        .filter(|device| !device.is_manual)
+        .collect();
+
+    if targets.is_empty() {
+        {
+            let mut config = state.inner.config.write().await;
+            config.offline_paths = paths;
+            save_config_file(&state.inner.config_path, &config)?;
+        }
+        emit_app_info_updated(&state.inner, &app).await;
+        return Ok(BatchSendResult {
+            transfer_ids: Vec::new(),
+            queued: true,
+            target_count: 0,
+        });
+    }
+
+    let mut transfer_ids = Vec::with_capacity(targets.len());
+    for target in targets {
+        let transfer_id = start_send_paths(
+            state.inner.clone(),
+            app.clone(),
+            paths.clone(),
+            target.id,
+            None,
+            false,
+        )
+        .await?;
+        transfer_ids.push(transfer_id);
+    }
+
+    Ok(BatchSendResult {
+        target_count: transfer_ids.len(),
+        transfer_ids,
+        queued: false,
+    })
 }
 
 #[tauri::command]
@@ -533,6 +732,18 @@ async fn copy_image_file(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn copy_text(text: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let mut clipboard = Clipboard::new().map_err(|error| format!("打开剪贴板失败: {error}"))?;
+        clipboard
+            .set_text(text)
+            .map_err(|error| format!("复制文字失败: {error}"))
+    })
+    .await
+    .map_err(|error| format!("复制文字任务失败: {error}"))?
+}
+
+#[tauri::command]
 fn hide_main_window(app: AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
@@ -577,6 +788,7 @@ async fn start_send_paths(
 
     let transfer = TransferSnapshot {
         id: transfer_id.clone(),
+        kind: TransferKind::File,
         direction: TransferDirection::Send,
         peer_id: target.id.clone(),
         peer_name: target.name.clone(),
@@ -594,6 +806,7 @@ async fn start_send_paths(
         } else {
             None
         },
+        text: None,
         source_paths: paths,
         can_retry: false,
         can_accept: false,
@@ -601,6 +814,7 @@ async fn start_send_paths(
         updated_at_ms: now,
     };
     update_transfer(&state, &app, transfer, true).await;
+    touch_device(&state, &app, &target.id).await;
 
     let state_for_task = state.clone();
     let transfer_id_for_task = transfer_id.clone();
@@ -623,6 +837,141 @@ async fn start_send_paths(
     Ok(transfer_id)
 }
 
+async fn start_send_text(
+    state: Arc<RuntimeState>,
+    app: AppHandle,
+    text: String,
+    target_device_id: String,
+) -> Result<String, String> {
+    validate_text_size(&text)?;
+    if text.trim().is_empty() {
+        return Err("请输入要发送的文字".to_string());
+    }
+
+    let target = {
+        let devices = state.devices.read().await;
+        devices
+            .get(&target_device_id)
+            .cloned()
+            .ok_or_else(|| "目标电脑不在线或不存在".to_string())?
+    };
+
+    let transfer_id = Uuid::new_v4().to_string();
+    let total_bytes = text.as_bytes().len() as u64;
+    let now = now_ms();
+    let config = state.config.read().await.clone();
+
+    let transfer = TransferSnapshot {
+        id: transfer_id.clone(),
+        kind: TransferKind::Text,
+        direction: TransferDirection::Send,
+        peer_id: target.id.clone(),
+        peer_name: target.name.clone(),
+        peer_ip: Some(target.ip.clone()),
+        peer_tcp_port: Some(target.tcp_port),
+        title: text_title(&text),
+        status: TransferStatus::Queued,
+        bytes_done: 0,
+        total_bytes,
+        file_count: 0,
+        current_file: None,
+        saved_path: None,
+        message: None,
+        text: Some(text.clone()),
+        source_paths: Vec::new(),
+        can_retry: false,
+        can_accept: false,
+        started_at_ms: now,
+        updated_at_ms: now,
+    };
+    update_transfer(&state, &app, transfer, true).await;
+    touch_device(&state, &app, &target.id).await;
+
+    let state_for_task = state.clone();
+    let transfer_id_for_task = transfer_id.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = send_text_task(
+            state_for_task.clone(),
+            app.clone(),
+            transfer_id_for_task.clone(),
+            target,
+            config,
+            text,
+            total_bytes,
+        )
+        .await
+        {
+            mark_transfer_failed(&state_for_task, &app, &transfer_id_for_task, error).await;
+        }
+    });
+
+    Ok(transfer_id)
+}
+
+async fn send_text_task(
+    state: Arc<RuntimeState>,
+    app: AppHandle,
+    transfer_id: String,
+    target: DeviceSnapshot,
+    config: Config,
+    text: String,
+    total_bytes: u64,
+) -> Result<(), String> {
+    patch_transfer(&state, &app, &transfer_id, true, |transfer| {
+        transfer.status = TransferStatus::Connecting;
+        transfer.message = Some(format!("连接 {}:{}", target.ip, target.tcp_port));
+    })
+    .await;
+
+    let address = format!("{}:{}", target.ip, target.tcp_port);
+    let mut stream = TcpStream::connect(&address)
+        .await
+        .map_err(|error| format!("连接 {address} 失败: {error}"))?;
+    touch_device(&state, &app, &target.id).await;
+
+    let request = TransferRequest {
+        protocol: APP_PROTOCOL.to_string(),
+        version: APP_VERSION.to_string(),
+        transfer_id: transfer_id.clone(),
+        kind: TransferKind::Text,
+        sender_id: config.device_id,
+        sender_name: config.device_name,
+        file_count: 0,
+        total_bytes,
+        files: Vec::new(),
+        text: Some(text),
+    };
+    write_json_frame(&mut stream, &request).await?;
+
+    patch_transfer(&state, &app, &transfer_id, true, |transfer| {
+        transfer.status = TransferStatus::Sending;
+        transfer.message = None;
+    })
+    .await;
+
+    let response: TransferResponse = read_json_frame(&mut stream).await?;
+    if !response.accepted {
+        return Err(response
+            .message
+            .unwrap_or_else(|| "接收端拒绝了这次传输".to_string()));
+    }
+
+    stream
+        .shutdown()
+        .await
+        .map_err(|error| format!("关闭连接失败: {error}"))?;
+
+    patch_transfer(&state, &app, &transfer_id, true, |transfer| {
+        transfer.status = TransferStatus::Completed;
+        transfer.bytes_done = total_bytes;
+        transfer.current_file = None;
+        transfer.message = Some("文字发送完成".to_string());
+    })
+    .await;
+
+    Ok(())
+}
+
 async fn send_files_task(
     state: Arc<RuntimeState>,
     app: AppHandle,
@@ -643,11 +992,13 @@ async fn send_files_task(
     let mut stream = TcpStream::connect(&address)
         .await
         .map_err(|error| format!("连接 {address} 失败: {error}"))?;
+    touch_device(&state, &app, &target.id).await;
 
     let request = TransferRequest {
         protocol: APP_PROTOCOL.to_string(),
         version: APP_VERSION.to_string(),
         transfer_id: transfer_id.clone(),
+        kind: TransferKind::File,
         sender_id: config.device_id,
         sender_name: config.device_name,
         file_count: files.len(),
@@ -659,6 +1010,7 @@ async fn send_files_task(
                 size: file.size,
             })
             .collect(),
+        text: None,
     };
     write_json_frame(&mut stream, &request).await?;
 
@@ -782,23 +1134,48 @@ async fn receive_transfer_task(
     if request.protocol != APP_PROTOCOL {
         return Err("不支持的传输协议".to_string());
     }
+    if matches!(request.kind, TransferKind::Text) {
+        let text = request
+            .text
+            .as_deref()
+            .ok_or_else(|| "文字传输缺少内容".to_string())?;
+        validate_text_size(text)?;
+    }
 
     let now = now_ms();
-    let title = request_title(&request.files);
-    let (peer_trusted, auto_accept_incoming) = {
+    let title = request_title(&request);
+    let (peer_trusted, auto_accept_incoming, sender_is_trusted) = {
         let config = state.config.read().await;
+        let sender_is_trusted = config
+            .trusted_device_ids
+            .iter()
+            .any(|id| id == &request.sender_id);
         (
-            config.auto_accept_incoming
-                || config
-                    .trusted_device_ids
-                    .iter()
-                    .any(|id| id == &request.sender_id),
+            config.auto_accept_incoming || sender_is_trusted,
             config.auto_accept_incoming,
+            sender_is_trusted,
         )
     };
 
+    upsert_device(
+        &state,
+        &app,
+        DeviceSnapshot {
+            id: request.sender_id.clone(),
+            name: request.sender_name.clone(),
+            ip: peer_addr.ip().to_string(),
+            tcp_port: TCP_PORT,
+            platform: "tcp".to_string(),
+            last_seen_ms: now,
+            is_manual: false,
+            is_trusted: sender_is_trusted,
+        },
+    )
+    .await;
+
     let mut transfer = TransferSnapshot {
         id: request.transfer_id.clone(),
+        kind: request.kind.clone(),
         direction: TransferDirection::Receive,
         peer_id: request.sender_id.clone(),
         peer_name: request.sender_name.clone(),
@@ -824,6 +1201,7 @@ async fn receive_transfer_task(
         } else {
             format!("来自 {}，等待接收确认", peer_addr.ip())
         }),
+        text: request.text.clone(),
         source_paths: Vec::new(),
         can_retry: false,
         can_accept: !peer_trusted,
@@ -869,6 +1247,28 @@ async fn receive_transfer_task(
             .await;
             return Ok(());
         }
+    }
+
+    if matches!(request.kind, TransferKind::Text) {
+        let response = TransferResponse {
+            accepted: true,
+            message: None,
+            offsets: Vec::new(),
+        };
+        write_json_frame(&mut stream, &response).await?;
+
+        patch_transfer(&state, &app, &request.transfer_id, true, |item| {
+            item.status = TransferStatus::Completed;
+            item.bytes_done = request.total_bytes;
+            item.can_accept = false;
+            item.current_file = None;
+            item.saved_path = None;
+            item.text = request.text.clone();
+            item.message = Some("文字接收完成".to_string());
+        })
+        .await;
+
+        return Ok(());
     }
 
     let inbox_dir = {
@@ -1066,7 +1466,6 @@ async fn run_discovery(state: Arc<RuntimeState>, app: AppHandle) -> Result<(), S
     let sender_socket = socket.clone();
     let sender_state = state.clone();
     tauri::async_runtime::spawn(async move {
-        let target = format!("255.255.255.255:{UDP_PORT}");
         let mut interval = time::interval(Duration::from_millis(DISCOVERY_INTERVAL_MS));
 
         loop {
@@ -1083,7 +1482,9 @@ async fn run_discovery(state: Arc<RuntimeState>, app: AppHandle) -> Result<(), S
             };
 
             if let Ok(payload) = serde_json::to_vec(&packet) {
-                let _ = sender_socket.send_to(&payload, &target).await;
+                for target in discovery_targets() {
+                    let _ = sender_socket.send_to(&payload, &target).await;
+                }
             }
         }
     });
@@ -1117,14 +1518,102 @@ async fn run_discovery(state: Arc<RuntimeState>, app: AppHandle) -> Result<(), S
                 is_trusted: config.trusted_device_ids.iter().any(|id| id == &device_id),
             };
 
-            state
-                .devices
-                .write()
-                .await
-                .insert(device.id.clone(), device);
+            upsert_device(&state, &app, device.clone()).await;
+            flush_offline_queue_to_first_device(state.clone(), app.clone(), device).await;
+        }
+    }
+}
 
-            let devices = snapshot_devices(&state).await;
-            let _ = app.emit("devices-updated", devices);
+fn discovery_targets() -> Vec<String> {
+    let mut targets = vec![format!("255.255.255.255:{UDP_PORT}")];
+
+    for ip in local_ips() {
+        let IpAddr::V4(ipv4) = ip else {
+            continue;
+        };
+        let [first, second, third, _] = ipv4.octets();
+        targets.push(format!("{first}.{second}.{third}.255:{UDP_PORT}"));
+    }
+
+    let mut seen = HashSet::new();
+    targets
+        .into_iter()
+        .filter(|target| seen.insert(target.clone()))
+        .collect()
+}
+
+async fn upsert_device(state: &Arc<RuntimeState>, app: &AppHandle, device: DeviceSnapshot) {
+    state
+        .devices
+        .write()
+        .await
+        .insert(device.id.clone(), device);
+    let devices = snapshot_devices(state).await;
+    let _ = app.emit("devices-updated", devices);
+}
+
+async fn touch_device(state: &Arc<RuntimeState>, app: &AppHandle, device_id: &str) {
+    {
+        let mut devices = state.devices.write().await;
+        if let Some(device) = devices.get_mut(device_id) {
+            device.last_seen_ms = now_ms();
+        } else {
+            return;
+        }
+    }
+
+    let devices = snapshot_devices(state).await;
+    let _ = app.emit("devices-updated", devices);
+}
+
+async fn flush_offline_queue_to_first_device(
+    state: Arc<RuntimeState>,
+    app: AppHandle,
+    target: DeviceSnapshot,
+) {
+    if target.is_manual {
+        return;
+    }
+
+    let paths = {
+        let mut config = state.config.write().await;
+        if config.offline_paths.is_empty() {
+            return;
+        }
+
+        let paths = config.offline_paths.clone();
+        config.offline_paths.clear();
+        if let Err(error) = save_config_file(&state.config_path, &config) {
+            eprintln!("clear offline queue failed: {error}");
+            return;
+        }
+        paths
+    };
+
+    emit_app_info_updated(&state, &app).await;
+
+    match start_send_paths(
+        state.clone(),
+        app.clone(),
+        paths.clone(),
+        target.id.clone(),
+        None,
+        false,
+    )
+    .await
+    {
+        Ok(_) => {
+            let _ = app.emit(
+                "offline-queue-started",
+                OfflineQueueStarted {
+                    target_name: target.name,
+                    paths,
+                },
+            );
+        }
+        Err(error) => {
+            eprintln!("offline queue send failed: {error}");
+            let _ = app.emit("offline-queue-failed", error);
         }
     }
 }
@@ -1247,9 +1736,24 @@ async fn persist_history(state: &Arc<RuntimeState>) {
 async fn snapshot_devices(state: &Arc<RuntimeState>) -> Vec<DeviceSnapshot> {
     let now = now_ms();
     let trusted = state.config.read().await.trusted_device_ids.clone();
+    let active_peer_ids: HashSet<String> = {
+        let transfers = state.transfers.read().await;
+        transfers
+            .values()
+            .filter(|transfer| {
+                !matches!(
+                    transfer.status,
+                    TransferStatus::Completed | TransferStatus::Failed
+                )
+            })
+            .map(|transfer| transfer.peer_id.clone())
+            .collect()
+    };
     let mut devices = state.devices.write().await;
     devices.retain(|_, device| {
-        device.is_manual || now.saturating_sub(device.last_seen_ms) <= DEVICE_STALE_MS
+        device.is_manual
+            || active_peer_ids.contains(&device.id)
+            || now.saturating_sub(device.last_seen_ms) <= DEVICE_STALE_MS
     });
 
     for device in devices.values_mut() {
@@ -1336,12 +1840,65 @@ fn transfer_title(files: &[LocalFileEntry]) -> String {
     }
 }
 
-fn request_title(files: &[FileManifest]) -> String {
-    match files {
+fn text_title(text: &str) -> String {
+    let preview = text
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .unwrap_or("文字消息");
+    let mut chars = preview.chars();
+    let shortened: String = chars.by_ref().take(28).collect();
+    if chars.next().is_some() {
+        format!("文字：{shortened}...")
+    } else {
+        format!("文字：{shortened}")
+    }
+}
+
+fn request_title(request: &TransferRequest) -> String {
+    if matches!(request.kind, TransferKind::Text) {
+        return request
+            .text
+            .as_deref()
+            .map(text_title)
+            .unwrap_or_else(|| "文字消息".to_string());
+    }
+
+    match request.files.as_slice() {
         [] => "未命名传输".to_string(),
         [file] => file.relative_path.clone(),
-        [first, ..] => format!("{} 等 {} 个文件", first.relative_path, files.len()),
+        [first, ..] => format!("{} 等 {} 个文件", first.relative_path, request.files.len()),
     }
+}
+
+fn validate_text_size(text: &str) -> Result<(), String> {
+    if text.as_bytes().len() > MAX_TEXT_BYTES {
+        return Err(format!(
+            "文字内容不能超过 {}",
+            format_bytes(MAX_TEXT_BYTES as u64)
+        ));
+    }
+
+    Ok(())
+}
+
+fn unique_nonempty_paths(paths: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| {
+            if path.trim().is_empty() {
+                return false;
+            }
+            seen.insert(path.clone())
+        })
+        .collect()
 }
 
 fn normalized_offsets(offsets: &[u64], len: usize) -> Vec<u64> {
@@ -1461,11 +2018,10 @@ async fn read_clipboard_image_to_file(state: &Arc<RuntimeState>) -> Result<PathB
     let height = image.height as u32;
     let rgba = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, image.bytes.into_owned())
         .ok_or_else(|| "剪贴板图片像素格式异常".to_string())?;
-    let dir = state
-        .config_path
-        .parent()
-        .ok_or_else(|| "配置路径异常".to_string())?
-        .join("clipboard");
+    let dir = {
+        let config = state.config.read().await;
+        PathBuf::from(&config.inbox_dir).join("cache")
+    };
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|error| format!("创建剪贴板缓存目录失败: {error}"))?;
@@ -1480,6 +2036,69 @@ async fn read_clipboard_image_to_file(state: &Arc<RuntimeState>) -> Result<PathB
     .map_err(|error| format!("保存剪贴板图片任务失败: {error}"))??;
 
     Ok(path)
+}
+
+#[cfg(target_os = "windows")]
+async fn read_clipboard_file_paths_impl() -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(read_clipboard_file_paths_windows)
+        .await
+        .map_err(|error| format!("读取剪贴板文件任务失败: {error}"))?
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn read_clipboard_file_paths_impl() -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "windows")]
+fn read_clipboard_file_paths_windows() -> Result<Vec<String>, String> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    };
+    use windows_sys::Win32::System::Ole::CF_HDROP;
+    use windows_sys::Win32::UI::Shell::DragQueryFileW;
+
+    unsafe {
+        if IsClipboardFormatAvailable(CF_HDROP as u32) == 0 {
+            return Ok(Vec::new());
+        }
+
+        if OpenClipboard(null_mut()) == 0 {
+            return Err("打开剪贴板失败".to_string());
+        }
+
+        let result = (|| {
+            let handle = GetClipboardData(CF_HDROP as u32);
+            if handle.is_null() {
+                return Err("剪贴板里没有可读取的文件".to_string());
+            }
+
+            let count = DragQueryFileW(handle, u32::MAX, null_mut(), 0);
+            let mut paths = Vec::with_capacity(count as usize);
+
+            for index in 0..count {
+                let len = DragQueryFileW(handle, index, null_mut(), 0);
+                if len == 0 {
+                    continue;
+                }
+
+                let mut buffer = vec![0_u16; len as usize + 1];
+                let written =
+                    DragQueryFileW(handle, index, buffer.as_mut_ptr(), buffer.len() as u32);
+                if written == 0 {
+                    continue;
+                }
+
+                paths.push(String::from_utf16_lossy(&buffer[..written as usize]));
+            }
+
+            Ok(paths)
+        })();
+
+        CloseClipboard();
+        result
+    }
 }
 
 fn config_path() -> Result<PathBuf, String> {
@@ -1747,15 +2366,23 @@ pub fn run() {
             list_transfers,
             set_inbox_dir,
             set_auto_accept_incoming,
+            set_text_draft,
+            queue_offline_paths,
             set_device_trusted,
             add_manual_device,
             send_paths,
             send_clipboard_image,
+            cache_clipboard_image,
+            read_clipboard_file_paths,
+            send_text,
+            broadcast_text,
+            broadcast_paths,
             retry_transfer,
             accept_incoming_transfer,
             decline_incoming_transfer,
             get_image_preview,
             copy_image_file,
+            copy_text,
             hide_main_window,
             quit_app
         ])

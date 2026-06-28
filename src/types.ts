@@ -3,9 +3,11 @@ export type AppInfo = {
   deviceName: string;
   inboxDir: string;
   localIp: string | null;
+  localIps: string[];
   tcpPort: number;
   udpPort: number;
   trustedDeviceIds: string[];
+  autoAcceptIncoming: boolean;
 };
 
 export type DeviceSnapshot = {

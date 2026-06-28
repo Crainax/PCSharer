@@ -1,11 +1,13 @@
 use arboard::Clipboard;
-use image::{ImageBuffer, Rgba};
+use base64::{engine::general_purpose, Engine as _};
+use image::{ImageBuffer, ImageFormat, Rgba};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    borrow::Cow,
+    collections::{HashMap, HashSet},
     env, fs,
-    io::SeekFrom,
-    net::{IpAddr, SocketAddr},
+    io::{Cursor, SeekFrom},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -29,12 +31,13 @@ const APP_PROTOCOL: &str = "pc-sharer-v2";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const UDP_PORT: u16 = 53342;
 const TCP_PORT: u16 = 53343;
-const DISCOVERY_INTERVAL_MS: u64 = 1800;
-const DEVICE_STALE_MS: u128 = 20_000;
+const DISCOVERY_INTERVAL_MS: u64 = 1000;
+const DEVICE_STALE_MS: u128 = 6_000;
 const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const INCOMING_DECISION_TIMEOUT_SECONDS: u64 = 300;
 const MAX_HISTORY_ITEMS: usize = 300;
+const MAX_IMAGE_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +47,8 @@ struct Config {
     inbox_dir: String,
     #[serde(default)]
     trusted_device_ids: Vec<String>,
+    #[serde(default)]
+    auto_accept_incoming: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,9 +58,11 @@ pub struct AppInfo {
     device_name: String,
     inbox_dir: String,
     local_ip: Option<String>,
+    local_ips: Vec<String>,
     tcp_port: u16,
     udp_port: u16,
     trusted_device_ids: Vec<String>,
+    auto_accept_incoming: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +207,7 @@ impl RuntimeState {
                 device_name: default_device_name(),
                 inbox_dir: default_inbox_dir().to_string_lossy().to_string(),
                 trusted_device_ids: Vec::new(),
+                auto_accept_incoming: false,
             };
             save_config_file(&config_path, &config)?;
             config
@@ -224,14 +232,17 @@ impl RuntimeState {
 #[tauri::command]
 async fn get_app_info(state: State<'_, AppState>) -> Result<AppInfo, String> {
     let config = state.inner.config.read().await.clone();
+    let local_ips = local_ips();
     Ok(AppInfo {
         device_id: config.device_id,
         device_name: config.device_name,
         inbox_dir: config.inbox_dir,
-        local_ip: local_ip().map(|ip| ip.to_string()),
+        local_ip: local_ips.first().map(|ip| ip.to_string()),
+        local_ips: local_ips.into_iter().map(|ip| ip.to_string()).collect(),
         tcp_port: TCP_PORT,
         udp_port: UDP_PORT,
         trusted_device_ids: config.trusted_device_ids,
+        auto_accept_incoming: config.auto_accept_incoming,
     })
 }
 
@@ -256,6 +267,20 @@ async fn set_inbox_dir(path: String, state: State<'_, AppState>) -> Result<AppIn
     {
         let mut config = state.inner.config.write().await;
         config.inbox_dir = inbox.to_string_lossy().to_string();
+        save_config_file(&state.inner.config_path, &config)?;
+    }
+
+    get_app_info(state).await
+}
+
+#[tauri::command]
+async fn set_auto_accept_incoming(
+    auto_accept: bool,
+    state: State<'_, AppState>,
+) -> Result<AppInfo, String> {
+    {
+        let mut config = state.inner.config.write().await;
+        config.auto_accept_incoming = auto_accept;
         save_config_file(&state.inner.config_path, &config)?;
     }
 
@@ -451,6 +476,76 @@ async fn decline_incoming_transfer(
         .decision_tx
         .send(false)
         .map_err(|_| "发送拒绝确认失败".to_string())
+}
+
+#[tauri::command]
+async fn get_image_preview(path: String) -> Result<Option<String>, String> {
+    let path = PathBuf::from(path);
+    if !is_image_path(&path) || !path.is_file() {
+        return Ok(None);
+    }
+
+    let size = fs::metadata(&path)
+        .map_err(|error| format!("读取图片信息失败: {error}"))?
+        .len();
+    if size > MAX_IMAGE_PREVIEW_BYTES {
+        return Ok(None);
+    }
+
+    tokio::task::spawn_blocking(move || -> Result<Option<String>, String> {
+        let image = image::open(&path)
+            .map_err(|error| format!("读取图片失败 {}: {error}", path.display()))?;
+        let thumbnail = image.thumbnail(360, 240);
+        let mut cursor = Cursor::new(Vec::new());
+        thumbnail
+            .write_to(&mut cursor, ImageFormat::Png)
+            .map_err(|error| format!("生成图片预览失败: {error}"))?;
+        let encoded = general_purpose::STANDARD.encode(cursor.into_inner());
+        Ok(Some(format!("data:image/png;base64,{encoded}")))
+    })
+    .await
+    .map_err(|error| format!("生成图片预览任务失败: {error}"))?
+}
+
+#[tauri::command]
+async fn copy_image_file(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    if !is_image_path(&path) || !path.is_file() {
+        return Err("这不是可复制的图片文件".to_string());
+    }
+
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let image = image::open(&path)
+            .map_err(|error| format!("读取图片失败 {}: {error}", path.display()))?;
+        let rgba = image.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let mut clipboard = Clipboard::new().map_err(|error| format!("打开剪贴板失败: {error}"))?;
+        clipboard
+            .set_image(arboard::ImageData {
+                width: width as usize,
+                height: height as usize,
+                bytes: Cow::Owned(rgba.into_raw()),
+            })
+            .map_err(|error| format!("复制图片失败: {error}"))
+    })
+    .await
+    .map_err(|error| format!("复制图片任务失败: {error}"))?
+}
+
+#[tauri::command]
+fn hide_main_window(app: AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_string())?;
+    window
+        .hide()
+        .map_err(|error| format!("后台运行失败: {error}"))
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
 }
 
 async fn start_send_paths(
@@ -690,12 +785,16 @@ async fn receive_transfer_task(
 
     let now = now_ms();
     let title = request_title(&request.files);
-    let peer_trusted = {
+    let (peer_trusted, auto_accept_incoming) = {
         let config = state.config.read().await;
-        config
-            .trusted_device_ids
-            .iter()
-            .any(|id| id == &request.sender_id)
+        (
+            config.auto_accept_incoming
+                || config
+                    .trusted_device_ids
+                    .iter()
+                    .any(|id| id == &request.sender_id),
+            config.auto_accept_incoming,
+        )
     };
 
     let mut transfer = TransferSnapshot {
@@ -717,7 +816,11 @@ async fn receive_transfer_task(
         current_file: None,
         saved_path: None,
         message: Some(if peer_trusted {
-            format!("来自 {}，已在白名单中", peer_addr.ip())
+            if auto_accept_incoming {
+                format!("来自 {}，已开启自动接收", peer_addr.ip())
+            } else {
+                format!("来自 {}，已在白名单中", peer_addr.ip())
+            }
         } else {
             format!("来自 {}，等待接收确认", peer_addr.ip())
         }),
@@ -1450,10 +1553,118 @@ fn default_inbox_dir() -> PathBuf {
         .join("PCSharer-Inbox")
 }
 
-fn local_ip() -> Option<IpAddr> {
+fn local_ips() -> Vec<IpAddr> {
+    let mut candidates = Vec::new();
+
+    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        for (name, ip) in interfaces {
+            if is_usable_local_ip(&ip) {
+                candidates.push((ip_score(&name, &ip), name, ip));
+            }
+        }
+    }
+
+    if let Some(ip) = outbound_local_ip() {
+        if is_usable_local_ip(&ip) {
+            candidates.push((ip_score("", &ip), String::new(), ip));
+        }
+    }
+
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for (_, _, ip) in candidates {
+        if seen.insert(ip.to_string()) {
+            output.push(ip);
+        }
+    }
+
+    output
+}
+
+fn outbound_local_ip() -> Option<IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
+    socket.connect("1.1.1.1:80").ok()?;
     socket.local_addr().ok().map(|addr| addr.ip())
+}
+
+fn is_usable_local_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(value) => {
+            !value.is_loopback()
+                && !value.is_link_local()
+                && !value.is_multicast()
+                && !value.is_broadcast()
+                && !value.is_unspecified()
+                && !is_benchmark_ipv4(value)
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
+fn is_benchmark_ipv4(ip: &Ipv4Addr) -> bool {
+    let [first, second, _, _] = ip.octets();
+    first == 198 && (second == 18 || second == 19)
+}
+
+fn ip_score(interface_name: &str, ip: &IpAddr) -> i32 {
+    let name = interface_name.to_ascii_lowercase();
+    let mut score = 0;
+
+    if let IpAddr::V4(value) = ip {
+        if value.is_private() {
+            score += 100;
+        }
+
+        if value.octets()[0] == 192 && value.octets()[1] == 168 {
+            score += 10;
+        }
+    }
+
+    if name.contains("wi-fi")
+        || name.contains("wifi")
+        || name.contains("wlan")
+        || name.contains("ethernet")
+        || name.contains("以太网")
+        || name.contains("无线")
+    {
+        score += 20;
+    }
+
+    if name.contains("virtual")
+        || name.contains("vmware")
+        || name.contains("virtualbox")
+        || name.contains("hyper-v")
+        || name.contains("wsl")
+        || name.contains("docker")
+        || name.contains("tailscale")
+        || name.contains("zerotier")
+        || name.contains("wireguard")
+        || name.contains("openvpn")
+        || name.contains("clash")
+        || name.contains("mihomo")
+        || name.contains("tap")
+        || name.contains("tun")
+        || name.contains("vpn")
+        || name.contains("vethernet")
+    {
+        score -= 1000;
+    }
+
+    score
+}
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn now_ms() -> u128 {
@@ -1535,14 +1746,25 @@ pub fn run() {
             list_devices,
             list_transfers,
             set_inbox_dir,
+            set_auto_accept_incoming,
             set_device_trusted,
             add_manual_device,
             send_paths,
             send_clipboard_image,
             retry_transfer,
             accept_incoming_transfer,
-            decline_incoming_transfer
+            decline_incoming_transfer,
+            get_image_preview,
+            copy_image_file,
+            hide_main_window,
+            quit_app
         ])
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(move |app| {
             setup_tray(app)?;
 
@@ -1551,7 +1773,7 @@ pub fn run() {
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        let _ = close_window.hide();
+                        let _ = close_window.emit("close-requested", ());
                     }
                 });
             }

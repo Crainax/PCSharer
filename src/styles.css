@@ -151,6 +151,27 @@ button {
   font-size: 13px;
 }
 
+.local-ip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.local-ip-row code {
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 8px;
+}
+
 .top-actions,
 .inline-actions {
   display: flex;
@@ -433,6 +454,24 @@ button {
   align-items: flex-start;
 }
 
+.image-preview {
+  width: 96px;
+  height: 72px;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  padding: 0;
+}
+
+.image-preview img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+
 .transfer-title {
   display: flex;
   align-items: center;
@@ -479,6 +518,10 @@ button {
   margin-top: 10px;
 }
 
+.file-actions .button {
+  min-height: 32px;
+}
+
 .progress-track {
   height: 7px;
   overflow: hidden;
@@ -514,6 +557,75 @@ button {
   word-break: break-word;
 }
 
+.setting-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  margin-bottom: 12px;
+  padding: 11px 12px;
+}
+
+.setting-toggle input {
+  width: 18px;
+  height: 18px;
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+.setting-toggle span,
+.setting-toggle strong,
+.setting-toggle small {
+  display: block;
+}
+
+.setting-toggle small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(7, 14, 17, 0.42);
+  padding: 18px;
+}
+
+.close-dialog {
+  width: min(420px, 100%);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-solid);
+  box-shadow: var(--shadow);
+  padding: 18px;
+}
+
+.close-dialog h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.close-dialog p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
 @media (max-width: 980px) {
   .workspace,
   .bottom-grid {
@@ -537,5 +649,15 @@ button {
 
   .top-actions .button {
     flex: 1;
+  }
+
+  .transfer-row {
+    flex-wrap: wrap;
+  }
+
+  .image-preview {
+    width: 100%;
+    height: auto;
+    aspect-ratio: 4 / 3;
   }
 }

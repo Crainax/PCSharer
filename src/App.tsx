@@ -10,13 +10,17 @@ import {
   CheckCircle2,
   CircleAlert,
   Clipboard,
+  Copy,
   Clock3,
+  Eye,
   FolderOpen,
   HardDriveDownload,
+  Minimize2,
   Moon,
   MonitorUp,
   Network,
   Plus,
+  Power,
   RefreshCw,
   RotateCcw,
   Search,
@@ -44,7 +48,8 @@ const statusLabel: Record<TransferSnapshot["status"], string> = {
 
 type ThemeName = "light" | "dark";
 
-const fallbackVersion = "0.2.1";
+const fallbackVersion = "0.2.2";
+const imageExtensions = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
 
 function getSystemTheme(): ThemeName {
   return window.matchMedia("(prefers-color-scheme: dark)").matches
@@ -59,6 +64,32 @@ function uniquePaths(paths: string[]): string[] {
 function basename(path: string): string {
   const normalized = path.replace(/\\/g, "/");
   return normalized.slice(normalized.lastIndexOf("/") + 1) || path;
+}
+
+function isImagePath(path: string | null | undefined): path is string {
+  if (!path) {
+    return false;
+  }
+
+  const cleanPath = path.split(/[?#]/, 1)[0];
+  const dotIndex = cleanPath.lastIndexOf(".");
+  if (dotIndex === -1) {
+    return false;
+  }
+
+  return imageExtensions.has(cleanPath.slice(dotIndex + 1).toLowerCase());
+}
+
+function transferDisplayPath(transfer: TransferSnapshot): string | null {
+  if (transfer.direction === "receive") {
+    return transfer.savedPath;
+  }
+
+  if (transfer.sourcePaths.length === 1) {
+    return transfer.sourcePaths[0];
+  }
+
+  return null;
 }
 
 function upsertTransfer(
@@ -76,6 +107,46 @@ function upsertTransfer(
   return copy.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 }
 
+function TransferImagePreview({ path }: { path: string }) {
+  const [preview, setPreview] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    setPreview(null);
+
+    invoke<string | null>("get_image_preview", { path })
+      .then((dataUrl) => {
+        if (active) {
+          setPreview(dataUrl);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setPreview(null);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [path]);
+
+  if (!preview) {
+    return null;
+  }
+
+  return (
+    <button
+      className="image-preview"
+      onClick={() => openPath(path)}
+      title="打开图片"
+      type="button"
+    >
+      <img alt={basename(path)} src={preview} />
+    </button>
+  );
+}
+
 export default function App() {
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [appVersion, setAppVersion] = useState(fallbackVersion);
@@ -88,6 +159,7 @@ export default function App() {
   const [historyQuery, setHistoryQuery] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [isCloseDialogOpen, setIsCloseDialogOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
   const selectedDevice = useMemo(
@@ -136,6 +208,10 @@ export default function App() {
       setTransfers((current) => upsertTransfer(current, event.payload));
     }).then((unlisten) => cleanups.push(unlisten));
 
+    listen<void>("close-requested", () => {
+      setIsCloseDialogOpen(true);
+    }).then((unlisten) => cleanups.push(unlisten));
+
     getCurrentWebview()
       .onDragDropEvent((event) => {
         const payload = event.payload;
@@ -163,7 +239,7 @@ export default function App() {
       invoke<DeviceSnapshot[]>("list_devices")
         .then(setDevices)
         .catch(() => undefined);
-    }, 3000);
+    }, 1000);
 
     return () => {
       window.clearInterval(timer);
@@ -172,7 +248,17 @@ export default function App() {
   }, [refresh]);
 
   useEffect(() => {
-    if (!selectedDeviceId && devices.length > 0) {
+    if (devices.length === 0) {
+      if (selectedDeviceId) {
+        setSelectedDeviceId("");
+      }
+      return;
+    }
+
+    if (
+      !selectedDeviceId ||
+      !devices.some((device) => device.id === selectedDeviceId)
+    ) {
       setSelectedDeviceId(devices[0].id);
     }
   }, [devices, selectedDeviceId]);
@@ -198,6 +284,17 @@ export default function App() {
 
     const next = await invoke<AppInfo>("set_inbox_dir", { path: picked });
     setAppInfo(next);
+  }, []);
+
+  const toggleAutoAcceptIncoming = useCallback(async (autoAccept: boolean) => {
+    try {
+      const next = await invoke<AppInfo>("set_auto_accept_incoming", {
+        autoAccept,
+      });
+      setAppInfo(next);
+    } catch (error) {
+      setNotice(String(error));
+    }
   }, []);
 
   const addManualDevice = useCallback(async () => {
@@ -304,6 +401,31 @@ export default function App() {
     }
   }, []);
 
+  const copyImageToClipboard = useCallback(async (path: string) => {
+    try {
+      await invoke<void>("copy_image_file", { path });
+      setNotice("图片已复制到剪贴板");
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, []);
+
+  const openTransferPath = useCallback(async (path: string) => {
+    try {
+      await openPath(path);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, []);
+
+  const revealTransferPath = useCallback(async (path: string) => {
+    try {
+      await revealItemInDir(path);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, []);
+
   const removeSelectedPath = useCallback((path: string) => {
     setSelectedPaths((current) => current.filter((item) => item !== path));
   }, []);
@@ -316,6 +438,23 @@ export default function App() {
 
   const toggleTheme = useCallback(() => {
     setTheme((current) => (current === "dark" ? "light" : "dark"));
+  }, []);
+
+  const hideToTray = useCallback(async () => {
+    try {
+      setIsCloseDialogOpen(false);
+      await invoke<void>("hide_main_window");
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }, []);
+
+  const quitApp = useCallback(async () => {
+    try {
+      await invoke<void>("quit_app");
+    } catch (error) {
+      setNotice(String(error));
+    }
   }, []);
 
   const normalizedHistoryQuery = historyQuery.trim().toLowerCase();
@@ -350,9 +489,19 @@ export default function App() {
           </div>
           <p className="muted">
             {appInfo
-              ? `${appInfo.deviceName} · ${appInfo.localIp ?? "未识别本机 IP"} · TCP ${appInfo.tcpPort}`
+              ? `${appInfo.deviceName} · TCP ${appInfo.tcpPort} · UDP ${appInfo.udpPort}`
               : "正在启动局域网服务"}
           </p>
+          {appInfo ? (
+            <div className="local-ip-row">
+              <span>本机 IP</span>
+              {appInfo.localIps.length > 0 ? (
+                appInfo.localIps.map((ip) => <code key={ip}>{ip}</code>)
+              ) : (
+                <code>未识别</code>
+              )}
+            </div>
+          ) : null}
         </div>
         <div className="top-actions">
           <button className="button secondary" onClick={toggleTheme} type="button">
@@ -563,9 +712,17 @@ export default function App() {
                   transfer.bytesDone,
                   transfer.totalBytes,
                 );
+                const displayPath =
+                  transfer.status === "completed"
+                    ? transferDisplayPath(transfer)
+                    : null;
+                const isImageTransfer = isImagePath(displayPath);
 
                 return (
                   <div className="transfer-row" key={transfer.id}>
+                    {isImageTransfer ? (
+                      <TransferImagePreview path={displayPath} />
+                    ) : null}
                     <div className="transfer-main">
                       <div className="transfer-title">
                         {transfer.status === "completed" ? (
@@ -623,6 +780,36 @@ export default function App() {
                           </button>
                         </div>
                       ) : null}
+                      {displayPath ? (
+                        <div className="transfer-actions file-actions">
+                          <button
+                            className="button secondary"
+                            onClick={() => openTransferPath(displayPath)}
+                            type="button"
+                          >
+                            <Eye size={16} />
+                            打开
+                          </button>
+                          <button
+                            className="button secondary"
+                            onClick={() => revealTransferPath(displayPath)}
+                            type="button"
+                          >
+                            <FolderOpen size={16} />
+                            定位
+                          </button>
+                          {isImageTransfer ? (
+                            <button
+                              className="button secondary"
+                              onClick={() => copyImageToClipboard(displayPath)}
+                              type="button"
+                            >
+                              <Copy size={16} />
+                              复制图片
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
                     {transfer.canRetry ? (
                       <button
@@ -636,16 +823,6 @@ export default function App() {
                         type="button"
                       >
                         <RotateCcw size={17} />
-                      </button>
-                    ) : null}
-                    {transfer.savedPath ? (
-                      <button
-                        className="icon-button"
-                        onClick={() => revealItemInDir(transfer.savedPath!)}
-                        title="在文件夹中显示"
-                        type="button"
-                      >
-                        <FolderOpen size={17} />
                       </button>
                     ) : null}
                   </div>
@@ -668,6 +845,20 @@ export default function App() {
             <span>收件箱</span>
             <strong>{appInfo?.inboxDir ?? "加载中"}</strong>
           </div>
+          <label className="setting-toggle">
+            <input
+              checked={Boolean(appInfo?.autoAcceptIncoming)}
+              disabled={!appInfo}
+              onChange={(event) =>
+                toggleAutoAcceptIncoming(event.currentTarget.checked)
+              }
+              type="checkbox"
+            />
+            <span>
+              <strong>自动接收</strong>
+              <small>开启后所有电脑发来的文件不再弹出确认</small>
+            </span>
+          </label>
           <div className="inline-actions">
             <button className="button secondary" onClick={chooseInbox} type="button">
               <FolderOpen size={16} />
@@ -680,6 +871,37 @@ export default function App() {
           </div>
         </div>
       </section>
+
+      {isCloseDialogOpen ? (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            aria-labelledby="close-dialog-title"
+            aria-modal="true"
+            className="close-dialog"
+            role="dialog"
+          >
+            <h2 id="close-dialog-title">关闭 PC Sharer</h2>
+            <p>选择后台运行会保留收发和局域网发现。</p>
+            <div className="dialog-actions">
+              <button className="button secondary" onClick={hideToTray} type="button">
+                <Minimize2 size={16} />
+                后台运行
+              </button>
+              <button className="button secondary" onClick={quitApp} type="button">
+                <Power size={16} />
+                关闭程序
+              </button>
+              <button
+                className="button primary"
+                onClick={() => setIsCloseDialogOpen(false)}
+                type="button"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
